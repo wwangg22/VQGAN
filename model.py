@@ -15,20 +15,22 @@ class Encoder(nn.Module):
             nn.ReLU(inplace=True),
             nn.Conv2d(hidden_channels, hidden_channels, kernel_size=1, stride=1)
         )
-        conv_layers = []
-        size = in_channels
-        for i in range(scale_factor):
-            conv_layers.append(
-                nn.Conv2d(size, hidden_channels // (2**(scale_factor-i)), kernel_size=4, stride=2, padding=1)
+        layers = []
+        # --- 1) Initial conv (stride=1) to go from RGB -> hidden_channels ---
+        layers.append(nn.Conv2d(in_channels, hidden_channels, kernel_size=3, stride=1, padding=1))
+        layers.append(nn.ReLU(inplace=True))
+
+        # --- 2) Downsample scale_factor times ---
+        for _ in range(scale_factor):
+            layers.append(
+                nn.Conv2d(hidden_channels, hidden_channels, kernel_size=4, stride=2, padding=1)
             )
-            conv_layers.append(nn.ReLU(inplace=True))
-            size = hidden_channels // (2 ** (scale_factor-i))
-        conv_layers += [
-            nn.Conv2d(hidden_channels // 2, hidden_channels, kernel_size=4, stride=2, padding=1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(hidden_channels, hidden_channels, kernel_size=3, stride=1, padding=1)
-        ]
-        self.conv = nn.Sequential(*conv_layers)
+            layers.append(nn.ReLU(inplace=True))
+
+        # --- 3) Optional final conv or res-block at stride=1 ---
+        layers.append(nn.Conv2d(hidden_channels, hidden_channels, kernel_size=3, stride=1, padding=1))
+
+        self.conv = nn.Sequential(*layers)
         # self.conv = nn.Sequential(
         #     nn.Conv2d(in_channels, hidden_channels // 4, kernel_size=4, stride=2, padding=1),
         #     nn.ReLU(inplace=True),
@@ -64,19 +66,21 @@ class Decoder(nn.Module):
             nn.ReLU(inplace=True),
             nn.Conv2d(hidden_channels, hidden_channels, kernel_size=1, stride=1)
         )
-        conv_layers=[]
-        size=hidden_channels
-        for i in range(scale_factor):
-            conv_layers.append(
-                nn.ConvTranspose2d(size, hidden_channels // (2**(i)), kernel_size=4, stride=2, padding=1)
+        layers = []
+        # --- 1) Optional initial conv (stride=1) to process latent features ---
+        layers.append(nn.Conv2d(hidden_channels, hidden_channels, kernel_size=3, stride=1, padding=1))
+
+        # --- 2) Upsample scale_factor times ---
+        for _ in range(scale_factor):
+            layers.append(
+                nn.ConvTranspose2d(hidden_channels, hidden_channels, kernel_size=4, stride=2, padding=1)
             )
-            conv_layers.append(nn.ReLU(inplace=True))
-            size = hidden_channels // (2**i)
-        
-        conv_layers += [
-            nn.ConvTranspose2d(hidden_channels // (2**i), out_channels, kernel_size=4, stride =2, padding=1),
-        ]
-        self.conv = nn.Sequential(*conv_layers)
+            layers.append(nn.ReLU(inplace=True))
+
+        # --- 3) Final conv to map hidden_channels -> out_channels (RGB) ---
+        layers.append(nn.Conv2d(hidden_channels, out_channels, kernel_size=3, stride=1, padding=1))
+
+        self.conv = nn.Sequential(*layers)
 
         # self.conv = nn.Sequential(
         #     nn.ConvTranspose2d(hidden_channels, hidden_channels // 2, kernel_size=4, stride=2, padding=1),
@@ -180,7 +184,7 @@ class VQGAN(nn.Module):
                  beta=0.25, save_img_embedding_map=False, disc_in_channels=3,
                  disc_num_layers=3, use_actnorm = False, disc_ndf=64,
                  embweight=1.0, pweight=1.0, dweight=1.0, 
-                 dthreshold=1000):
+                 dthreshold=5000):
         super().__init__()
         # encode image into continuous latent space
         self.encoder = Encoder(in_channels=3, hidden_channels=h_dim, scale_factor=scale_factor)
@@ -193,7 +197,7 @@ class VQGAN(nn.Module):
         self.decoder = Decoder(in_channels=embedding_dim, hidden_channels=h_dim, out_channels=3, scale_factor=scale_factor)
         self.embweight = embweight
 
-        self.discriminator = NLayerDiscriminator(nput_nc=disc_in_channels,
+        self.discriminator = NLayerDiscriminator(input_nc=disc_in_channels,
                                                  n_layers=disc_num_layers,
                                                  use_actnorm=use_actnorm,
                                                  ndf=disc_ndf
@@ -233,14 +237,15 @@ class VQGAN(nn.Module):
 
         nll_loss = rec_loss
         nll_loss = torch.mean(nll_loss)
+        # print('nll_loss:', nll_loss)
 
         if gen_update:
             #this update is for the generator to fool the discriminator
             logits_fake = self.discriminator(x_hat.contiguous())
             g_loss = -torch.mean(logits_fake)
             #normalize the loss of the discriminiator so it does not overpower gradient update to VAE
-            nll_grads = torch.autograd.grad(nll_loss, self.get_last_layer(), retain_graph=True)[0]
-            g_grads = torch.autograd.grad(g_loss, self.get_last_layer(), retain_graph=True)[0]
+            nll_grads = torch.autograd.grad(nll_loss, self.get_last_layer().weight, retain_graph=True)[0]
+            g_grads = torch.autograd.grad(g_loss, self.get_last_layer().weight, retain_graph=True)[0]
             d_weight = torch.norm(nll_grads) / (torch.norm(g_grads) + 1e-4)
             d_weight = torch.clamp(d_weight, 0.0, 1e4).detach()
             d_weight = d_weight * self.dweight
@@ -248,11 +253,14 @@ class VQGAN(nn.Module):
             disc_factor = 1.0
             if self.step < self.dthreshold:
                 disc_factor = 0.0
+            # print('disc_factor:', disc_factor)
             loss = nll_loss + d_weight * disc_factor * g_loss + self.embweight * embedding_loss.mean()
+            # print("embedding_loss:", embedding_loss.mean())
+            self.step+=1
         else:
             #this update is for the discriminator
-            logits_real = self.discriminator(x.contigous().detach())
-            logits_fake = self.discriminator(x_hat.contigous().detach())
+            logits_real = self.discriminator(x.contiguous().detach())
+            logits_fake = self.discriminator(x_hat.contiguous().detach())
             #zero out the gradient of the discriminator for the first n steps
             disc_factor = 1.0
             if self.step < self.dthreshold:
@@ -263,7 +271,7 @@ class VQGAN(nn.Module):
             d_loss = 0.5 * (loss_real + loss_fake)
 
             loss = disc_factor * d_loss
-        self.step+=1
+        
         if verbose:
             print('original data shape:', x.shape)
             print('encoded data shape:', z_e.shape)

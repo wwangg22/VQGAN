@@ -1,0 +1,6 @@
+__pycache__/
+images/
+laion-high-resolution/
+output_images/
+model.pth
+xhat_debug.png

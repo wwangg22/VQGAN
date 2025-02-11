@@ -1,4 +1,4 @@
-from model import VQGAN
+from model2 import VQGAN
 import torch
 import torch.optim as optim
 import numpy as np
@@ -14,10 +14,13 @@ transform = T.Compose([
 ])
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-model = VQGAN(h_dim=468, n_embeddings=64, embedding_dim=32, scale_factor=5, dthreshold=0).to(device)
+model = VQGAN( n_embeddings=128, embedding_dim=64, 
+              out_ch=3, ch_mult=(1,2,4,8), num_res_blocks=2, 
+                ch=64, attn_resolutions = [16],
+               dthreshold=10000).to(device)
 
 # Load the model
-model.load_model("model.pth")
+# model.load_model("model.pth")
 
 gen_optimizer = optim.Adam(
     list(model.encoder.parameters()) + 
